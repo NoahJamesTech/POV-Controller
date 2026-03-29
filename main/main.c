@@ -43,14 +43,12 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0x
 #define MOTOR_UPDATE_MS      50
 #define ENABLE_MOTOR_INIT_SEQUENCE 0
 
-#define RPM_CTRL_KP          0.22f
-#define RPM_CTRL_KI          0.04f
-#define RPM_INTEGRATOR_UNWIND 0.85f
+#define RPM_CTRL_KP          0.80f
+#define RPM_CTRL_KI          0.18f
 
-// Conservative motion safety limits for fragile hardware.
 #define RPM_SLEW_UP_PER_SEC      240U
 #define RPM_SLEW_DOWN_PER_SEC    360U
-#define DUTY_SLEW_PER_SEC        900U
+#define DUTY_SLEW_PER_SEC        1800U
 #define DUTY_START_THRESHOLD      1020U
 
 // ── 3-phase encoder inputs ───────────────────────────────────────────────────
@@ -78,7 +76,6 @@ static volatile bool gMotorInitDone;
 static volatile uint32_t gEncoderPulseCount;
 static portMUX_TYPE gEncoderMux = portMUX_INITIALIZER_UNLOCKED;
 
-// ── OLED state ───────────────────────────────────────────────────────────────
 static i2c_master_bus_handle_t sOledI2cBus = NULL;
 static i2c_master_dev_handle_t sOledI2cDev = NULL;
 static bool sOledReady = false;
@@ -218,15 +215,12 @@ static uint16_t pulsesToBladeRpm(uint32_t pulses, uint32_t windowMs)
     }
     return (uint16_t)rpm;
 }
-
-// ── ESC duty from RPM ─────────────────────────────────────────────────────────
-// Maps target RPM (0-3000) linearly to ESC duty (min-max).
 static uint32_t rpmToEscDuty(uint16_t rpm)
 {
     if (rpm == 0) return ESC_DUTY_MIN;
-    if (rpm >= 3000) return ESC_DUTY_MAX;
-    return ESC_DUTY_MIN +
-           (uint32_t)((uint64_t)(ESC_DUTY_MAX - ESC_DUTY_MIN) * rpm / 3000);
+    uint32_t duty = 1003U + ((uint32_t)rpm * 106U) / 1000U;
+    if (duty > ESC_DUTY_MAX) duty = ESC_DUTY_MAX;
+    return duty;
 }
 
 static void escInitialSpin(void)
@@ -388,10 +382,13 @@ static void motorTask(void *arg)
         } else {
             float error = (float)commandedRpm - (float)filteredRpm;
             float ffDuty = (float)rpmToEscDuty(commandedRpm);
+            if (ffDuty < (float)DUTY_START_THRESHOLD) {
+                ffDuty = (float)DUTY_START_THRESHOLD;
+            }
 
             if ((error > 0.0f && integralTerm < 0.0f) ||
                 (error < 0.0f && integralTerm > 0.0f)) {
-                integralTerm *= RPM_INTEGRATOR_UNWIND;
+                integralTerm *= 0.70f;
             }
 
             integralTerm += error * dtSec;
@@ -407,14 +404,17 @@ static void motorTask(void *arg)
             float dutyF = ffDuty + (RPM_CTRL_KP * error) + (RPM_CTRL_KI * integralTerm);
             if (dutyF < dutyMin) {
                 dutyF = dutyMin;
+                if (error < 0.0f) {
+                    integralTerm -= error * dtSec;
+                }
             } else if (dutyF > dutyMax) {
                 dutyF = dutyMax;
+                if (error > 0.0f) {
+                    integralTerm -= error * dtSec;
+                }
             }
-            dutyCmd = (uint32_t)dutyF;
 
-            if (dutyCmd > 0 && dutyCmd < DUTY_START_THRESHOLD) {
-                dutyCmd = DUTY_START_THRESHOLD;
-            }
+            dutyCmd = (uint32_t)dutyF;        
         }
 
         uint32_t duty = dutyCmd;
