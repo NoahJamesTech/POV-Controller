@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/ledc.h"
@@ -12,6 +13,7 @@
 #include "esp_wifi.h"
 #include "esp_now.h"
 #include "nvs_flash.h"
+#include "esp_rom_sys.h"
 #include "oled_draw.h"
 
 static const char *TAG = "POVMotor";
@@ -55,6 +57,8 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0x
 #define ENCODER_A_PIN        13
 #define ENCODER_B_PIN        12
 #define ENCODER_C_PIN        11
+#define ZERO_PULSE_PIN        9
+#define ZERO_PULSE_WIDTH_US   300
 #define ENCODER_PHASE_COUNT  3U
 #define ENCODER_COUNT_BOTH_EDGES 1
 #define ENCODER_COUNTS_PER_MOTOR_ROTATION 42U
@@ -74,7 +78,12 @@ static volatile uint16_t gTargetRpm;
 static volatile uint16_t gCurrentRpm;
 static volatile bool gMotorInitDone;
 static volatile uint32_t gEncoderPulseCount;
+static volatile int64_t gEncoderPulseTotalSigned;
+static volatile int64_t gTotalDegrees;
+static volatile uint8_t gEncoderPrevState;
+static volatile bool gEncoderPrevStateValid;
 static portMUX_TYPE gEncoderMux = portMUX_INITIALIZER_UNLOCKED;
+static TaskHandle_t gZeroPulseTaskHandle = NULL;
 
 static i2c_master_bus_handle_t sOledI2cBus = NULL;
 static i2c_master_dev_handle_t sOledI2cDev = NULL;
@@ -187,9 +196,54 @@ static void displayTask(void *arg)
 static void IRAM_ATTR encoderPulseIsr(void *arg)
 {
     (void)arg;
+    bool rotationBoundaryHit = false;
+
+    uint8_t state = ((uint8_t)gpio_get_level(ENCODER_A_PIN) << 2) |
+                    ((uint8_t)gpio_get_level(ENCODER_B_PIN) << 1) |
+                    (uint8_t)gpio_get_level(ENCODER_C_PIN);
+
     portENTER_CRITICAL_ISR(&gEncoderMux);
     gEncoderPulseCount++;
+
+    static const uint8_t hallSeq[6] = {0x1, 0x5, 0x4, 0x6, 0x2, 0x3};
+    int8_t prevIdx = -1;
+    int8_t currIdx = -1;
+    for (int i = 0; i < 6; i++) {
+        if (hallSeq[i] == gEncoderPrevState) {
+            prevIdx = (int8_t)i;
+        }
+        if (hallSeq[i] == state) {
+            currIdx = (int8_t)i;
+        }
+    }
+
+    int8_t directionStep = 0;
+    if (gEncoderPrevStateValid && prevIdx >= 0 && currIdx >= 0 && state != gEncoderPrevState) {
+        if (currIdx == (int8_t)((prevIdx + 1) % 6)) {
+            directionStep = 1;
+        } else if (currIdx == (int8_t)((prevIdx + 5) % 6)) {
+            directionStep = -1;
+        }
+    }
+
+    if (directionStep != 0) {
+        gEncoderPulseTotalSigned += directionStep;
+        if ((gEncoderPulseTotalSigned % (int64_t)ENCODER_PULSES_PER_BLADE_ROTATION) == 0) {
+            rotationBoundaryHit = true;
+        }
+    }
+
+    gEncoderPrevState = state;
+    gEncoderPrevStateValid = true;
     portEXIT_CRITICAL_ISR(&gEncoderMux);
+
+    if (rotationBoundaryHit && gZeroPulseTaskHandle != NULL) {
+        BaseType_t highTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(gZeroPulseTaskHandle, &highTaskWoken);
+        if (highTaskWoken == pdTRUE) {
+            portYIELD_FROM_ISR();
+        }
+    }
 }
 
 static uint32_t encoderConsumePulses(void)
@@ -200,6 +254,15 @@ static uint32_t encoderConsumePulses(void)
     gEncoderPulseCount = 0;
     portEXIT_CRITICAL(&gEncoderMux);
     return pulses;
+}
+
+static int64_t encoderGetTotalPulsesSigned(void)
+{
+    int64_t totalPulses;
+    portENTER_CRITICAL(&gEncoderMux);
+    totalPulses = gEncoderPulseTotalSigned;
+    portEXIT_CRITICAL(&gEncoderMux);
+    return totalPulses;
 }
 
 static uint16_t pulsesToBladeRpm(uint32_t pulses, uint32_t windowMs)
@@ -236,6 +299,24 @@ static void escInitialSpin(void)
         ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, ESC_DUTY_MIN);
         ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
         vTaskDelay(pdMS_TO_TICKS(250));
+    }
+}
+
+static inline void zeroPulseFire(void)
+{
+    gpio_set_level(ZERO_PULSE_PIN, 1);
+    esp_rom_delay_us(ZERO_PULSE_WIDTH_US);
+    gpio_set_level(ZERO_PULSE_PIN, 0);
+}
+
+static void zeroPulseTask(void *arg)
+{
+    (void)arg;
+    while (1) {
+        uint32_t pendingPulses = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        for (uint32_t i = 0; i < pendingPulses; i++) {
+            zeroPulseFire();
+        }
     }
 }
 
@@ -353,6 +434,8 @@ static void motorTask(void *arg)
     while (1) {
         uint16_t requestedRpm = gTargetRpm;
         uint32_t pulses = encoderConsumePulses();
+        int64_t totalPulsesSigned = encoderGetTotalPulsesSigned();
+        gTotalDegrees = (totalPulsesSigned * 360LL) / ENCODER_PULSES_PER_BLADE_ROTATION;
         uint16_t measuredRpm = pulsesToBladeRpm(pulses, MOTOR_UPDATE_MS);
 
         if (commandedRpm < requestedRpm) {
@@ -445,9 +528,9 @@ static void motorTask(void *arg)
         if (logDivider >= 10) {
             logDivider = 0;
             ESP_LOGI(TAG,
-                     "CL RPM: req=%u cmd=%u measured=%u duty=%u pulses=%u",
+                     "CL RPM: req=%u cmd=%u measured=%u duty=%u pulses=%u totalDeg=%" PRId64,
                      requestedRpm, commandedRpm, filteredRpm,
-                     (unsigned)lastDuty, (unsigned)pulses);
+                     (unsigned)lastDuty, (unsigned)pulses, gTotalDegrees);
         }
 
         TickType_t nowTick = xTaskGetTickCount();
@@ -510,11 +593,33 @@ static void encoderInit(void)
     ESP_ERROR_CHECK(gpio_isr_handler_add(ENCODER_B_PIN, encoderPulseIsr, NULL));
     ESP_ERROR_CHECK(gpio_isr_handler_add(ENCODER_C_PIN, encoderPulseIsr, NULL));
 
+    gEncoderPrevState = ((uint8_t)gpio_get_level(ENCODER_A_PIN) << 2) |
+                        ((uint8_t)gpio_get_level(ENCODER_B_PIN) << 1) |
+                        (uint8_t)gpio_get_level(ENCODER_C_PIN);
+    gEncoderPrevStateValid = true;
+    gEncoderPulseTotalSigned = 0;
+    gTotalDegrees = 0;
+
     ESP_LOGI(TAG,
              "Encoder ready: A=%d B=%d C=%d, edge=%s, pulses/rev=%u (42 motor counts * 7 motor/blade across %u phases)",
              ENCODER_A_PIN, ENCODER_B_PIN, ENCODER_C_PIN,
              ENCODER_COUNT_BOTH_EDGES ? "both" : "rising",
              ENCODER_PULSES_PER_BLADE_ROTATION, ENCODER_PHASE_COUNT);
+}
+
+static void zeroPulseInit(void)
+{
+    gpio_config_t cfg = {
+        .pin_bit_mask = (1ULL << ZERO_PULSE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&cfg));
+    gpio_set_level(ZERO_PULSE_PIN, 0);
+    ESP_LOGI(TAG, "Zero-angle pulse output ready on GPIO%d (%uus high)",
+             ZERO_PULSE_PIN, ZERO_PULSE_WIDTH_US);
 }
 
 static void wifiInit(void)
@@ -551,6 +656,7 @@ void app_main(void)
 
     escPwmInit();
     encoderInit();
+    zeroPulseInit();
     oledInit();
     wifiInit();
 
@@ -568,6 +674,7 @@ void app_main(void)
 
     espnowInit();
 
+    xTaskCreate(zeroPulseTask, "zero_pulse", 2048, NULL, 6, &gZeroPulseTaskHandle);
     xTaskCreate(motorTask, "motor", 2048, NULL, 5, NULL);
     xTaskCreate(displayTask, "display", 4096, NULL, 4, NULL);
 
