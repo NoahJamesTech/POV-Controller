@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/param.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -11,17 +12,19 @@
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "esp_rom_sys.h"
 
 static const char *TAG = "POVMotor";
 
 // ── MAC address of the POVDisplay board ───────────────────────────────────────
-static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0xFC};
+static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x9C, 0x13, 0x9E, 0xF4, 0x22, 0x45};
 
 // ── ESC PWM output ────────────────────────────────────────────────────────────
-// TODO: set this to the actual GPIO pin connected to the ESC signal wire
-#define ESC_PWM_PIN       1
+#define ESC_PWM_PIN       2
 
 // ── ESC PWM parameters ───────────────────────────────────────────────────────
 // 50Hz, 1.0-2.0ms pulse width (standard ESC servo signal)
@@ -35,6 +38,7 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0x
 
 #define RPM_CTRL_KP          0.80f
 #define RPM_CTRL_KI          0.18f
+#define RPM_CTRL_KD          0.001f
 
 #define RPM_SLEW_UP_PER_SEC      240U
 #define RPM_SLEW_DOWN_PER_SEC    360U
@@ -42,9 +46,9 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0x
 #define DUTY_START_THRESHOLD      1020U
 
 // ── 3-phase encoder inputs ───────────────────────────────────────────────────
-#define ENCODER_A_PIN        13
-#define ENCODER_B_PIN        12
-#define ENCODER_C_PIN        11
+#define ENCODER_A_PIN        6
+#define ENCODER_B_PIN        4
+#define ENCODER_C_PIN        5
 #define ZERO_PULSE_PIN        9
 #define ZERO_PULSE_WIDTH_US   300
 #define ENCODER_PHASE_COUNT  3U
@@ -269,6 +273,7 @@ static void motorTask(void *arg)
     uint32_t lastDuty = 0xFFFFFFFFU;
     uint16_t filteredRpm = 0;
     float integralTerm = 0.0f;
+    float prevError = 0.0f;
     uint16_t commandedRpm = 0;
     const float dtSec = (float)MOTOR_UPDATE_MS / 1000.0f;
     const float dutyMin = (float)ESC_DUTY_MIN;
@@ -341,9 +346,13 @@ static void motorTask(void *arg)
         uint32_t dutyCmd;
         if (commandedRpm == 0) {
             integralTerm = 0.0f;
+            prevError = 0.0f;
             dutyCmd = ESC_DUTY_MIN;
         } else {
             float error = (float)commandedRpm - (float)filteredRpm;
+            float dError = (error - prevError) / dtSec;
+            prevError = error;
+
             float ffDuty = (float)rpmToEscDuty(commandedRpm);
             if (ffDuty < (float)DUTY_START_THRESHOLD) {
                 ffDuty = (float)DUTY_START_THRESHOLD;
@@ -364,7 +373,7 @@ static void motorTask(void *arg)
                 }
             }
 
-            float dutyF = ffDuty + (RPM_CTRL_KP * error) + (RPM_CTRL_KI * integralTerm);
+            float dutyF = ffDuty + (RPM_CTRL_KP * error) + (RPM_CTRL_KI * integralTerm) + (RPM_CTRL_KD * dError);
             if (dutyF < dutyMin) {
                 dutyF = dutyMin;
                 if (error < 0.0f) {
@@ -502,16 +511,120 @@ static void zeroPulseInit(void)
              ZERO_PULSE_PIN, ZERO_PULSE_WIDTH_US);
 }
 
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+    esp_ota_handle_t update_handle = 0;
+    const esp_partition_t *update_partition = NULL;
+
+    ESP_LOGI(TAG, "Starting OTA...");
+
+    update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "Next update partition not found!");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAPartition");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTABegin");
+        return err;
+    }
+
+    int received = 0;
+    int remaining = req->content_len;
+    char buf[1024];
+
+    while (remaining > 0) {
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)))) <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Failed receiving OTA data");
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(update_handle, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAWrite");
+            return err;
+        }
+        remaining -= received;
+    }
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAEnd");
+        return err;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTABoot");
+        return err;
+    }
+
+    ESP_LOGI(TAG, "OTA successful, rebooting...");
+    httpd_resp_sendstr(req, "OTA Complete. Rebooting...\n");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t ota_uri = {
+            .uri       = "/update",
+            .method    = HTTP_POST,
+            .handler   = ota_post_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &ota_uri);
+    }
+    return server;
+}
+
 static void wifiInit(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Create default netifs for AP and STA so both interfaces can be started
+    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = "POV Controller",
+            .ssid_len = strlen("POV Controller"),
+            .password = "1234512345",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .channel = 1 // Ensure this matches your ESP-NOW peer's channel
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Start HTTP server for OTA
+    start_webserver();
 }
 
 static void espnowInit(void)

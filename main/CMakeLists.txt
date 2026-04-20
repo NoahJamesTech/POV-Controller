@@ -10,4 +10,6 @@ idf_component_register(SRCS "main.c"
                            freertos
                            log
                            esp_hw_support
+                           esp_http_server
+                           app_update
                        INCLUDE_DIRS "")
