@@ -38,7 +38,10 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x9C, 0x13, 0x9E, 0xF4, 0x22, 0x
 
 #define RPM_CTRL_KP          0.80f
 #define RPM_CTRL_KI          0.18f
-#define RPM_CTRL_KD          0.001f
+#define RPM_CTRL_KD          0.01f
+
+// P .8 / I .18 / D .001
+
 
 #define RPM_SLEW_UP_PER_SEC      240U
 #define RPM_SLEW_DOWN_PER_SEC    360U
@@ -49,9 +52,9 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x9C, 0x13, 0x9E, 0xF4, 0x22, 0x
 #define ENCODER_A_PIN        6
 #define ENCODER_B_PIN        4
 #define ENCODER_C_PIN        5
-#define ZERO_PULSE_PIN        9
+#define ZERO_PULSE_PIN        12
 #define ZERO_PULSE_WIDTH_US   300
-#define ENCODER_PHASE_COUNT  3U
+#define ENCODER_PHASE_COUNT  3U 
 #define ENCODER_COUNT_BOTH_EDGES 1
 #define ENCODER_COUNTS_PER_MOTOR_ROTATION 42U
 #define MOTOR_ROTATIONS_PER_BLADE_ROTATION 7U
@@ -332,7 +335,7 @@ static void motorTask(void *arg)
         }
 
         // 1st-order LPF to smooth pulse quantization at low speed.
-        filteredRpm = (uint16_t)(((uint32_t)filteredRpm + measuredRpm) / 2U);
+        filteredRpm = (uint16_t)(((uint32_t)filteredRpm * 3U + measuredRpm) / 4U);
         gCurrentRpm = filteredRpm;
 
         uint8_t arrowDir = POV_ARROW_STEADY;
