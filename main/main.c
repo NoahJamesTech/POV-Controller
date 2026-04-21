@@ -36,14 +36,14 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x9C, 0x13, 0x9E, 0xF4, 0x22, 0x
 #define MOTOR_UPDATE_MS      50
 #define ENABLE_MOTOR_INIT_SEQUENCE 0
 
-#define RPM_CTRL_KP          0.80f
-#define RPM_CTRL_KI          0.18f
-#define RPM_CTRL_KD          0.01f
+static float g_kp = 0.80f;
+static float g_ki = 0.18f;
+static float g_kd = 0.0001f;
 
 // P .8 / I .18 / D .001
 
 
-#define RPM_SLEW_UP_PER_SEC      240U
+#define RPM_SLEW_UP_PER_SEC      60U
 #define RPM_SLEW_DOWN_PER_SEC    360U
 #define DUTY_SLEW_PER_SEC        1800U
 #define DUTY_START_THRESHOLD      1020U
@@ -361,14 +361,9 @@ static void motorTask(void *arg)
                 ffDuty = (float)DUTY_START_THRESHOLD;
             }
 
-            if ((error > 0.0f && integralTerm < 0.0f) ||
-                (error < 0.0f && integralTerm > 0.0f)) {
-                integralTerm *= 0.70f;
-            }
-
             integralTerm += error * dtSec;
-            if (RPM_CTRL_KI > 0.0f) {
-                float iLimit = dutySpan / RPM_CTRL_KI;
+            if (g_ki > 0.0f) {
+                float iLimit = dutySpan / g_ki;
                 if (integralTerm > iLimit) {
                     integralTerm = iLimit;
                 } else if (integralTerm < -iLimit) {
@@ -376,7 +371,7 @@ static void motorTask(void *arg)
                 }
             }
 
-            float dutyF = ffDuty + (RPM_CTRL_KP * error) + (RPM_CTRL_KI * integralTerm) + (RPM_CTRL_KD * dError);
+            float dutyF = ffDuty + (g_kp * error) + (g_ki * integralTerm) + (g_kd * dError);
             if (dutyF < dutyMin) {
                 dutyF = dutyMin;
                 if (error < 0.0f) {
@@ -514,6 +509,65 @@ static void zeroPulseInit(void)
              ZERO_PULSE_PIN, ZERO_PULSE_WIDTH_US);
 }
 
+static const char* tuner_html = "<!DOCTYPE html><html><head><title>POV Tuning</title></head><body style=\"font-family:sans-serif;\">"
+"<h3>POV PID Tuning</h3>"
+"<canvas id=\"g\" width=\"600\" height=\"300\" style=\"border:1px solid #000; background:#eee;\"></canvas><br>"
+"<span style=\"color:red; font-weight:bold;\">Target RPM</span> | <span style=\"color:blue; font-weight:bold;\">Current RPM</span><br><br>"
+"P: <input id=\"p\" size=\"8\"> "
+"I: <input id=\"i\" size=\"8\"> "
+"D: <input id=\"d\" size=\"8\"> "
+"<button onclick=\"s()\">Set PID</button>"
+"<div id=\"v\" style=\"margin-top:10px; font-weight:bold;\"></div>"
+"<script>"
+"let c=document.getElementById('g').getContext('2d'), d=[];"
+"setInterval(()=>{"
+  "fetch('/status').then(r=>r.json()).then(j=>{"
+    "document.getElementById('v').innerText='Target: '+j.t+' | Current: '+j.c;"
+    "if(document.activeElement.id !== 'p' && document.activeElement.id !== 'i' && document.activeElement.id !== 'd'){"
+      "if(!document.getElementById('p').value){"
+        "document.getElementById('p').value=j.p;"
+        "document.getElementById('i').value=j.i;"
+        "document.getElementById('d').value=j.d;"
+      "}"
+    "}"
+    "d.push(j); if(d.length>600) d.shift();"
+    "c.clearRect(0,0,600,300);"
+    "c.beginPath(); c.strokeStyle='red'; c.lineWidth=2;"
+    "d.forEach((p,i)=>{let y=300-(p.t/2000*300); i==0?c.moveTo(i,y):c.lineTo(i,y);}); c.stroke();"
+    "c.beginPath(); c.strokeStyle='blue'; c.lineWidth=2;"
+    "d.forEach((p,i)=>{let y=300-(p.c/2000*300); i==0?c.moveTo(i,y):c.lineTo(i,y);}); c.stroke();"
+  "})"
+"}, 100);"
+"function s(){"
+  "fetch('/tune?p='+document.getElementById('p').value+'&i='+document.getElementById('i').value+'&d='+document.getElementById('d').value);"
+"}"
+"</script></body></html>";
+
+static esp_err_t index_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_sendstr(req, tuner_html);
+}
+
+static esp_err_t status_handler(httpd_req_t *req) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"t\":%u,\"c\":%u,\"p\":%.5f,\"i\":%.5f,\"d\":%.5f}",
+             gTargetRpm, gCurrentRpm, g_kp, g_ki, g_kd);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t tune_handler(httpd_req_t *req) {
+    char buf[100];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char param[32];
+        if (httpd_query_key_value(buf, "p", param, sizeof(param)) == ESP_OK) g_kp = atof(param);
+        if (httpd_query_key_value(buf, "i", param, sizeof(param)) == ESP_OK) g_ki = atof(param);
+        if (httpd_query_key_value(buf, "d", param, sizeof(param)) == ESP_OK) g_kd = atof(param);
+        ESP_LOGI(TAG, "Tuned PID: P=%.5f I=%.5f D=%.5f", g_kp, g_ki, g_kd);
+    }
+    return httpd_resp_sendstr(req, "OK");
+}
+
 static esp_err_t ota_post_handler(httpd_req_t *req)
 {
     esp_err_t err;
@@ -587,13 +641,15 @@ static httpd_handle_t start_webserver(void)
     httpd_handle_t server = NULL;
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t ota_uri = {
-            .uri       = "/update",
-            .method    = HTTP_POST,
-            .handler   = ota_post_handler,
-            .user_ctx  = NULL
-        };
+        httpd_uri_t ota_uri = { .uri = "/update", .method = HTTP_POST, .handler = ota_post_handler, .user_ctx = NULL };
+        httpd_uri_t idx_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
+        httpd_uri_t stat_uri = { .uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL };
+        httpd_uri_t tune_uri = { .uri = "/tune", .method = HTTP_GET, .handler = tune_handler, .user_ctx = NULL };
+        
         httpd_register_uri_handler(server, &ota_uri);
+        httpd_register_uri_handler(server, &idx_uri);
+        httpd_register_uri_handler(server, &stat_uri);
+        httpd_register_uri_handler(server, &tune_uri);
     }
     return server;
 }
