@@ -1,39 +1,30 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <sys/param.h>
 #include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
-#include "driver/i2c_master.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_wifi.h"
 #include "esp_now.h"
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_ota_ops.h"
 #include "nvs_flash.h"
 #include "esp_rom_sys.h"
-#include "oled_draw.h"
 
 static const char *TAG = "POVMotor";
 
 // ── MAC address of the POVDisplay board ───────────────────────────────────────
-static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0xFC};
+static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x9C, 0x13, 0x9E, 0xF4, 0x22, 0x45};
 
 // ── ESC PWM output ────────────────────────────────────────────────────────────
-// TODO: set this to the actual GPIO pin connected to the ESC signal wire
-#define ESC_PWM_PIN       1
-
-// ── OLED (SSD1306, 128x64 over I2C) ─────────────────────────────────────────
-#define OLED_I2C_SCL_PIN    3
-#define OLED_I2C_SDA_PIN    4
-#define OLED_I2C_PORT       I2C_NUM_0
-#define OLED_I2C_FREQ_HZ    400000
-#define OLED_I2C_ADDR_8BIT  0x78
-#define OLED_I2C_ADDR_7BIT  (OLED_I2C_ADDR_8BIT >> 1)
-#define OLED_SEG_REMAP_CMD  0xA1
-#define OLED_COM_SCAN_CMD   0xC0
+#define ESC_PWM_PIN       2
 
 // ── ESC PWM parameters ───────────────────────────────────────────────────────
 // 50Hz, 1.0-2.0ms pulse width (standard ESC servo signal)
@@ -45,21 +36,25 @@ static uint8_t receiverMac[ESP_NOW_ETH_ALEN] = {0x94, 0xA9, 0x90, 0x37, 0x2F, 0x
 #define MOTOR_UPDATE_MS      50
 #define ENABLE_MOTOR_INIT_SEQUENCE 0
 
-#define RPM_CTRL_KP          0.80f
-#define RPM_CTRL_KI          0.18f
+static float g_kp = 0.80f;
+static float g_ki = 0.18f;
+static float g_kd = 0.0001f;
 
-#define RPM_SLEW_UP_PER_SEC      240U
+// P .8 / I .18 / D .001
+
+
+#define RPM_SLEW_UP_PER_SEC      60U
 #define RPM_SLEW_DOWN_PER_SEC    360U
 #define DUTY_SLEW_PER_SEC        1800U
 #define DUTY_START_THRESHOLD      1020U
 
 // ── 3-phase encoder inputs ───────────────────────────────────────────────────
-#define ENCODER_A_PIN        13
-#define ENCODER_B_PIN        12
-#define ENCODER_C_PIN        11
-#define ZERO_PULSE_PIN        9
+#define ENCODER_A_PIN        6
+#define ENCODER_B_PIN        4
+#define ENCODER_C_PIN        5
+#define ZERO_PULSE_PIN        12
 #define ZERO_PULSE_WIDTH_US   300
-#define ENCODER_PHASE_COUNT  3U
+#define ENCODER_PHASE_COUNT  3U 
 #define ENCODER_COUNT_BOTH_EDGES 1
 #define ENCODER_COUNTS_PER_MOTOR_ROTATION 42U
 #define MOTOR_ROTATIONS_PER_BLADE_ROTATION 7U
@@ -84,114 +79,6 @@ static volatile uint8_t gEncoderPrevState;
 static volatile bool gEncoderPrevStateValid;
 static portMUX_TYPE gEncoderMux = portMUX_INITIALIZER_UNLOCKED;
 static TaskHandle_t gZeroPulseTaskHandle = NULL;
-
-static i2c_master_bus_handle_t sOledI2cBus = NULL;
-static i2c_master_dev_handle_t sOledI2cDev = NULL;
-static bool sOledReady = false;
-
-static void oledInit(void)
-{
-    i2c_master_bus_config_t busCfg = {
-        .i2c_port = OLED_I2C_PORT,
-        .sda_io_num = OLED_I2C_SDA_PIN,
-        .scl_io_num = OLED_I2C_SCL_PIN,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_ERROR_CHECK(i2c_new_master_bus(&busCfg, &sOledI2cBus));
-
-    i2c_device_config_t devCfg = {
-        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-        .device_address = OLED_I2C_ADDR_7BIT,
-        .scl_speed_hz = OLED_I2C_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(sOledI2cBus, &devCfg, &sOledI2cDev));
-    oledDrawAttachDevice(sOledI2cDev);
-
-    const uint8_t initSeq[] = {
-        0xAE, 0xD5, 0x80, 0xA8, 0x3F, 0xD3, 0x00, 0x40,
-        0x8D, 0x14, 0x20, 0x00, OLED_SEG_REMAP_CMD, OLED_COM_SCAN_CMD, 0xDA, 0x12,
-        0x81, 0xCF, 0xD9, 0xF1, 0xDB, 0x40, 0xA4, 0xA6,
-        0x2E, 0xAF,
-    };
-    for (size_t i = 0; i < sizeof(initSeq); i++) {
-        ESP_ERROR_CHECK(oledDrawSendCmd(initSeq[i]));
-    }
-
-    ESP_ERROR_CHECK(oledDrawClear());
-    sOledReady = true;
-    ESP_LOGI(TAG, "OLED SSD1306 ready on I2C SCL=%d SDA=%d addr=0x%02X(7-bit from 0x%02X) remap=0x%02X com=0x%02X",
-             OLED_I2C_SCL_PIN, OLED_I2C_SDA_PIN, OLED_I2C_ADDR_7BIT,
-             OLED_I2C_ADDR_8BIT,
-             OLED_SEG_REMAP_CMD, OLED_COM_SCAN_CMD);
-}
-
-static void displayTask(void *arg)
-{
-    uint16_t lastCurrentRpm = 0xFFFF;
-    uint16_t lastTargetRpm = 0xFFFF;
-    int8_t lastTrend = 0;
-    bool lastInitDone = true;
-
-    while (1) {
-        bool initDone = gMotorInitDone;
-        uint16_t currentRpm = gCurrentRpm;
-        uint16_t targetRpm = gTargetRpm;
-        int8_t trend = 0;
-
-        if (!initDone) {
-            if (sOledReady && lastInitDone) {
-                oledDrawLineHuge(0, "INIT");
-                oledDrawLine(3, "");
-                oledDrawLine(4, "");
-                oledDrawLine(5, "");
-                oledDrawLineBig(6, "");
-            }
-            lastInitDone = false;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        if (!lastInitDone) {
-            lastCurrentRpm = 0xFFFF;
-            lastTargetRpm = 0xFFFF;
-            lastTrend = 0;
-            lastInitDone = true;
-        }
-
-        if (lastCurrentRpm != 0xFFFF) {
-            if (currentRpm > lastCurrentRpm) {
-                trend = 1;
-            } else if (currentRpm < lastCurrentRpm) {
-                trend = -1;
-            }
-        }
-
-        if (currentRpm != lastCurrentRpm || targetRpm != lastTargetRpm || trend != lastTrend) {
-            char lineCurrentBig[40];
-            char lineTarget[22];
-            char trendChar = (trend > 0) ? 'v' : (trend < 0) ? '^' : '-';
-
-            snprintf(lineCurrentBig, sizeof(lineCurrentBig), "%4u %c", currentRpm, trendChar);
-            snprintf(lineTarget, sizeof(lineTarget), "TGT %4u", targetRpm);
-
-            if (sOledReady) {
-                oledDrawLineHuge(0, lineCurrentBig);
-                oledDrawLine(3, "");
-                oledDrawLine(4, "");
-                oledDrawLine(5, "");
-                oledDrawLineBig(6, lineTarget);
-            }
-
-            lastCurrentRpm = currentRpm;
-            lastTargetRpm = targetRpm;
-            lastTrend = trend;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
 
 static void IRAM_ATTR encoderPulseIsr(void *arg)
 {
@@ -389,6 +276,7 @@ static void motorTask(void *arg)
     uint32_t lastDuty = 0xFFFFFFFFU;
     uint16_t filteredRpm = 0;
     float integralTerm = 0.0f;
+    float prevError = 0.0f;
     uint16_t commandedRpm = 0;
     const float dtSec = (float)MOTOR_UPDATE_MS / 1000.0f;
     const float dutyMin = (float)ESC_DUTY_MIN;
@@ -447,7 +335,7 @@ static void motorTask(void *arg)
         }
 
         // 1st-order LPF to smooth pulse quantization at low speed.
-        filteredRpm = (uint16_t)(((uint32_t)filteredRpm + measuredRpm) / 2U);
+        filteredRpm = (uint16_t)(((uint32_t)filteredRpm * 3U + measuredRpm) / 4U);
         gCurrentRpm = filteredRpm;
 
         uint8_t arrowDir = POV_ARROW_STEADY;
@@ -461,22 +349,21 @@ static void motorTask(void *arg)
         uint32_t dutyCmd;
         if (commandedRpm == 0) {
             integralTerm = 0.0f;
+            prevError = 0.0f;
             dutyCmd = ESC_DUTY_MIN;
         } else {
             float error = (float)commandedRpm - (float)filteredRpm;
+            float dError = (error - prevError) / dtSec;
+            prevError = error;
+
             float ffDuty = (float)rpmToEscDuty(commandedRpm);
             if (ffDuty < (float)DUTY_START_THRESHOLD) {
                 ffDuty = (float)DUTY_START_THRESHOLD;
             }
 
-            if ((error > 0.0f && integralTerm < 0.0f) ||
-                (error < 0.0f && integralTerm > 0.0f)) {
-                integralTerm *= 0.70f;
-            }
-
             integralTerm += error * dtSec;
-            if (RPM_CTRL_KI > 0.0f) {
-                float iLimit = dutySpan / RPM_CTRL_KI;
+            if (g_ki > 0.0f) {
+                float iLimit = dutySpan / g_ki;
                 if (integralTerm > iLimit) {
                     integralTerm = iLimit;
                 } else if (integralTerm < -iLimit) {
@@ -484,7 +371,7 @@ static void motorTask(void *arg)
                 }
             }
 
-            float dutyF = ffDuty + (RPM_CTRL_KP * error) + (RPM_CTRL_KI * integralTerm);
+            float dutyF = ffDuty + (g_kp * error) + (g_ki * integralTerm) + (g_kd * dError);
             if (dutyF < dutyMin) {
                 dutyF = dutyMin;
                 if (error < 0.0f) {
@@ -622,16 +509,181 @@ static void zeroPulseInit(void)
              ZERO_PULSE_PIN, ZERO_PULSE_WIDTH_US);
 }
 
+static const char* tuner_html = "<!DOCTYPE html><html><head><title>POV Tuning</title></head><body style=\"font-family:sans-serif;\">"
+"<h3>POV PID Tuning</h3>"
+"<canvas id=\"g\" width=\"600\" height=\"300\" style=\"border:1px solid #000; background:#eee;\"></canvas><br>"
+"<span style=\"color:red; font-weight:bold;\">Target RPM</span> | <span style=\"color:blue; font-weight:bold;\">Current RPM</span><br><br>"
+"P: <input id=\"p\" size=\"8\"> "
+"I: <input id=\"i\" size=\"8\"> "
+"D: <input id=\"d\" size=\"8\"> "
+"<button onclick=\"s()\">Set PID</button>"
+"<div id=\"v\" style=\"margin-top:10px; font-weight:bold;\"></div>"
+"<script>"
+"let c=document.getElementById('g').getContext('2d'), d=[];"
+"setInterval(()=>{"
+  "fetch('/status').then(r=>r.json()).then(j=>{"
+    "document.getElementById('v').innerText='Target: '+j.t+' | Current: '+j.c;"
+    "if(document.activeElement.id !== 'p' && document.activeElement.id !== 'i' && document.activeElement.id !== 'd'){"
+      "if(!document.getElementById('p').value){"
+        "document.getElementById('p').value=j.p;"
+        "document.getElementById('i').value=j.i;"
+        "document.getElementById('d').value=j.d;"
+      "}"
+    "}"
+    "d.push(j); if(d.length>600) d.shift();"
+    "c.clearRect(0,0,600,300);"
+    "c.beginPath(); c.strokeStyle='red'; c.lineWidth=2;"
+    "d.forEach((p,i)=>{let y=300-(p.t/2000*300); i==0?c.moveTo(i,y):c.lineTo(i,y);}); c.stroke();"
+    "c.beginPath(); c.strokeStyle='blue'; c.lineWidth=2;"
+    "d.forEach((p,i)=>{let y=300-(p.c/2000*300); i==0?c.moveTo(i,y):c.lineTo(i,y);}); c.stroke();"
+  "})"
+"}, 100);"
+"function s(){"
+  "fetch('/tune?p='+document.getElementById('p').value+'&i='+document.getElementById('i').value+'&d='+document.getElementById('d').value);"
+"}"
+"</script></body></html>";
+
+static esp_err_t index_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_sendstr(req, tuner_html);
+}
+
+static esp_err_t status_handler(httpd_req_t *req) {
+    char buf[128];
+    snprintf(buf, sizeof(buf), "{\"t\":%u,\"c\":%u,\"p\":%.5f,\"i\":%.5f,\"d\":%.5f}",
+             gTargetRpm, gCurrentRpm, g_kp, g_ki, g_kd);
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_sendstr(req, buf);
+}
+
+static esp_err_t tune_handler(httpd_req_t *req) {
+    char buf[100];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char param[32];
+        if (httpd_query_key_value(buf, "p", param, sizeof(param)) == ESP_OK) g_kp = atof(param);
+        if (httpd_query_key_value(buf, "i", param, sizeof(param)) == ESP_OK) g_ki = atof(param);
+        if (httpd_query_key_value(buf, "d", param, sizeof(param)) == ESP_OK) g_kd = atof(param);
+        ESP_LOGI(TAG, "Tuned PID: P=%.5f I=%.5f D=%.5f", g_kp, g_ki, g_kd);
+    }
+    return httpd_resp_sendstr(req, "OK");
+}
+
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+    esp_ota_handle_t update_handle = 0;
+    const esp_partition_t *update_partition = NULL;
+
+    ESP_LOGI(TAG, "Starting OTA...");
+
+    update_partition = esp_ota_get_next_update_partition(NULL);
+    if (update_partition == NULL) {
+        ESP_LOGE(TAG, "Next update partition not found!");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAPartition");
+        return ESP_FAIL;
+    }
+
+    err = esp_ota_begin(update_partition, OTA_WITH_SEQUENTIAL_WRITES, &update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_begin failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTABegin");
+        return err;
+    }
+
+    int received = 0;
+    int remaining = req->content_len;
+    char buf[1024];
+
+    while (remaining > 0) {
+        if ((received = httpd_req_recv(req, buf, MIN(remaining, sizeof(buf)))) <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Failed receiving OTA data");
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Receive");
+            return ESP_FAIL;
+        }
+        err = esp_ota_write(update_handle, buf, received);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_ota_write failed (%s)", esp_err_to_name(err));
+            esp_ota_abort(update_handle);
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAWrite");
+            return err;
+        }
+        remaining -= received;
+    }
+
+    err = esp_ota_end(update_handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_end failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTAEnd");
+        return err;
+    }
+
+    err = esp_ota_set_boot_partition(update_partition);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "esp_ota_set_boot_partition failed (%s)", esp_err_to_name(err));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OTABoot");
+        return err;
+    }
+
+    ESP_LOGI(TAG, "OTA successful, rebooting...");
+    httpd_resp_sendstr(req, "OTA Complete. Rebooting...\n");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+static httpd_handle_t start_webserver(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    httpd_handle_t server = NULL;
+
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t ota_uri = { .uri = "/update", .method = HTTP_POST, .handler = ota_post_handler, .user_ctx = NULL };
+        httpd_uri_t idx_uri = { .uri = "/", .method = HTTP_GET, .handler = index_handler, .user_ctx = NULL };
+        httpd_uri_t stat_uri = { .uri = "/status", .method = HTTP_GET, .handler = status_handler, .user_ctx = NULL };
+        httpd_uri_t tune_uri = { .uri = "/tune", .method = HTTP_GET, .handler = tune_handler, .user_ctx = NULL };
+        
+        httpd_register_uri_handler(server, &ota_uri);
+        httpd_register_uri_handler(server, &idx_uri);
+        httpd_register_uri_handler(server, &stat_uri);
+        httpd_register_uri_handler(server, &tune_uri);
+    }
+    return server;
+}
+
 static void wifiInit(void)
 {
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
+    // Create default netifs for AP and STA so both interfaces can be started
+    esp_netif_create_default_wifi_ap();
+    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_config_t ap_cfg = {
+        .ap = {
+            .ssid = "POV Controller",
+            .ssid_len = strlen("POV Controller"),
+            .password = "1234512345",
+            .max_connection = 4,
+            .authmode = WIFI_AUTH_WPA2_PSK,
+            .channel = 1 // Ensure this matches your ESP-NOW peer's channel
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_cfg));
     ESP_ERROR_CHECK(esp_wifi_start());
+
+    // Start HTTP server for OTA
+    start_webserver();
 }
 
 static void espnowInit(void)
@@ -657,7 +709,6 @@ void app_main(void)
     escPwmInit();
     encoderInit();
     zeroPulseInit();
-    oledInit();
     wifiInit();
 
     // Print this board's MAC so you can paste it into the display's controller_mac
@@ -676,7 +727,6 @@ void app_main(void)
 
     xTaskCreate(zeroPulseTask, "zero_pulse", 2048, NULL, 6, &gZeroPulseTaskHandle);
     xTaskCreate(motorTask, "motor", 2048, NULL, 5, NULL);
-    xTaskCreate(displayTask, "display", 4096, NULL, 4, NULL);
 
     ESP_LOGI(TAG, "Motor controller ready (closed-loop RPM, waiting for target RPM via ESP-NOW)");
 }
